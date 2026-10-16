@@ -6,4 +6,4 @@ Hosted copies of the browser (WebAssembly) builds of [effectcraft](https://githu
 - Specific version: `/effectcraft/v<version>/`
 - Version list: `/effectcraft/versions.json`
 
-Each version folder is the unmodified contents of upstream's `effectcraft-web-<version>.zip` release asset, including its license files. Upstream license: . A scheduled workflow mirrors new releases.
+Each version folder is the unmodified contents of upstream's `effectcraft-web-<version>.zip` release asset, including its license files. Upstream license: Apache-2.0. A scheduled workflow mirrors new releases.
