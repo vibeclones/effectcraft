@@ -57,6 +57,26 @@ function req(r) {
   return new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
 }
 
+// Run `op` on `store` in a readwrite transaction of its own; resolves once the transaction has
+// committed. A request's success doesn't mean the write is stored: the transaction can still
+// abort afterwards (quota at commit, the browser closing), rolling it back, and a write
+// reported as saved then is never retried (#1242). A failed request aborts the transaction
+// with its error; an explicit abort leaves no error, hence the AbortError.
+function write(db, store, op) {
+  return new Promise((res, rej) => {
+    let tx = null;
+    try {
+      tx = db.transaction(store, "readwrite");
+      tx.oncomplete = () => res();
+      tx.onabort = () => rej(tx.error ?? new DOMException("the storage transaction was aborted", "AbortError"));
+      op(tx.objectStore(store));
+    } catch (e) {
+      try { tx?.abort(); } catch {}
+      rej(e);
+    }
+  });
+}
+
 async function idb() {
   if (!self.indexedDB) throw new Error("no IndexedDB");
   const open = indexedDB.open(DB, 1);
@@ -70,10 +90,10 @@ async function idb() {
       return all.map((r) => ({ key: r.key, data: new Uint8Array(r.data), modified: r.modified }));
     },
     async put(key, data, modified) {
-      await req(tx("readwrite").put({ key, data: data.slice().buffer, modified }));
+      await write(db, STORE, (s) => s.put({ key, data: data.slice().buffer, modified }));
     },
     async del(key) {
-      await req(tx("readwrite").delete(key));
+      await write(db, STORE, (s) => s.delete(key));
     },
   };
 }
@@ -278,8 +298,8 @@ export function audioStop() {
 
 // ------------------------------------------------------------------ workers
 
-// Idle workers are reused; each keeps the files it was sent (path → size) so a file goes to a
-// worker once.
+// Idle workers are reused; each keeps the files it was sent (path → version) so a file goes to a
+// worker once, and again when it was replaced (even by one of the same size, #218).
 const idle = [];
 const running = new Map(); // job id → {worker, done}
 // Job workers open a WebGPU device of their own (unless `?nogpuworkers`): their jobs' frames
@@ -310,11 +330,20 @@ function spawn(base) {
   return w;
 }
 
-/// Run a job in a worker. `files`: [[path, Uint8Array]] the job reads; `onMessage(type, json,
+/// Run a job in a worker. `files`: [[path, Uint8Array, version]] the job reads (`version`
+/// changes with every write of the file); `onMessage(type, json,
 /// path, bytes)` receives "reply" (json), "file" (path, bytes: a rendered file to download),
 /// "store" (path, bytes: a file to keep in browser storage) and "error" (json = message).
 export function workerRun(id, json, files, base, onMessage) {
-  const w = idle.pop() ?? spawn(base);
+  let w;
+  try {
+    w = idle.pop() ?? spawn(base);
+  } catch (e) {
+    // `new Worker` throws at once when the page's origin is opaque (a sandboxed iframe): the job
+    // fails like one whose worker didn't start.
+    setTimeout(() => onMessage("error", String((e && e.message) || e), null, null));
+    return;
+  }
   running.set(id, w);
   w.ready.then(() => {
     w.worker.onmessage = (e) => {
@@ -339,14 +368,17 @@ export function workerRun(id, json, files, base, onMessage) {
       onMessage("error", String(e.message || "worker error"), null, null);
       w.worker.terminate();
     };
-    for (const [path, bytes] of files) {
-      if (w.files.get(path) === bytes.length) continue;
-      w.files.set(path, bytes.length);
+    for (const [path, bytes, version] of files) {
+      const tag = version ?? bytes.length;
+      if (w.files.get(path) === tag) continue;
+      w.files.set(path, tag);
       w.worker.postMessage({ type: "file", path, bytes });
     }
     w.worker.postMessage({ type: "job", json });
   }, (e) => {
+    // The worker didn't start (#216): the job fails and the worker goes.
     running.delete(id);
+    w.worker.terminate();
     onMessage("error", String(e.message || e), null, null);
   });
 }
@@ -376,7 +408,17 @@ const frameWorkers = [];
 /// GPU effects on it.
 export function frameWorkerStart(base, onMessage, gpu) {
   const index = frameWorkers.length;
-  const worker = new Worker(new URL("worker.js", base), { type: "module", name: `effectcraft-frames-${index}` });
+  let worker;
+  try {
+    worker = new Worker(new URL("worker.js", base), { type: "module", name: `effectcraft-frames-${index}` });
+  } catch (e) {
+    // The constructor throws at once when the page's origin is opaque (a sandboxed iframe). The
+    // slot stays, and the failure is reported like a worker that died, after the caller has
+    // recorded the index: frames then render on the page's thread (as with `?noworkers`).
+    frameWorkers.push(null);
+    setTimeout(() => onMessage(index, undefined, undefined, String((e && e.message) || e || "frame worker failed")));
+    return index;
+  }
   worker.onmessage = (e) => {
     const m = e.data;
     if (m && m.type === "frameReply") onMessage(index, m.json, m.bytes ? new Uint8Array(m.bytes) : null, undefined);
@@ -400,7 +442,7 @@ export function frameWorkerStart(base, onMessage, gpu) {
 // ends in a checksum) and read the layer buffers they prefetch; the page lists, reads and
 // deletes.
 const CACHE_ROOT = "effectcraft-cache";
-const CACHE_KINDS = ["frames", "layers"];
+const CACHE_KINDS = ["frames", "layers", "mattes"];
 const cacheDirHandles = {};
 
 async function cacheDir(kind = "frames") {
@@ -415,6 +457,7 @@ async function cacheDir(kind = "frames") {
 /// The folder and file name of an entry name (`layers/<hex>.ecc` or `<hex>.ecc`).
 async function entryDir(name) {
   if (name.startsWith("layers/")) return [await cacheDir("layers"), name.slice(7)];
+  if (name.startsWith("mattes/")) return [await cacheDir("mattes"), name.slice(7)];
   return [await cacheDir("frames"), name];
 }
 
@@ -451,8 +494,12 @@ export async function cacheRead(name) {
 /// resolves with its size.
 export async function cacheWrite(fullName, bytes) {
   const [dir, name] = await entryDir(fullName);
-  const canMove = typeof FileSystemHandle !== "undefined" && "move" in FileSystemHandle.prototype;
-  const tmp = canMove ? `${name}.tmp.${Math.random().toString(36).slice(2)}` : name;
+  const canMove =
+    typeof FileSystemHandle !== "undefined" &&
+    "move" in FileSystemHandle.prototype &&
+    typeof crypto !== "undefined" &&
+    typeof crypto.randomUUID === "function";
+  const tmp = canMove ? `${name}.tmp.${crypto.randomUUID()}` : name;
   const fh = await dir.getFileHandle(tmp, { create: true });
   if (fh.createSyncAccessHandle) {
     const h = await fh.createSyncAccessHandle();
@@ -545,7 +592,7 @@ async function openFolder(handle, remember) {
   if (remember) {
     try {
       const db = await handlesDb();
-      await req(db.transaction("folders", "readwrite").objectStore("folders").put({ name, handle }));
+      await write(db, "folders", (s) => s.put({ name, handle }));
     } catch (e) { console.info("media browser: cannot remember the folder", e); }
   }
   return { name, entries };
@@ -597,7 +644,7 @@ export async function browseForget(name) {
   folders.delete(name);
   try {
     const db = await handlesDb();
-    await req(db.transaction("folders", "readwrite").objectStore("folders").delete(name));
+    await write(db, "folders", (s) => s.delete(name));
   } catch {}
 }
 
@@ -611,22 +658,72 @@ export async function browseRead(path) {
 }
 
 /// The fallback where folders can't be opened: pick files (or a whole folder, `directory`) with a
-/// plain file input; resolves with [{path, bytes}] (path relative to the picked folder).
+/// plain file input; resolves with [{path, bytes}] (path relative to the picked folder). A file
+/// that can't be read is listed as {path, error} instead (#226); cancelling resolves with [].
 export function browsePickFiles(directory) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const input = document.createElement("input");
     input.type = "file";
     input.multiple = true;
     if (directory) input.webkitdirectory = true;
+    input.oncancel = () => resolve([]);
     input.onchange = async () => {
-      try {
-        const out = [];
-        for (const f of input.files) {
-          out.push({ path: (directory && f.webkitRelativePath) || f.name, bytes: new Uint8Array(await f.arrayBuffer()) });
+      const out = [];
+      for (const f of input.files) {
+        const path = (directory && f.webkitRelativePath) || f.name;
+        try {
+          out.push({ path, bytes: new Uint8Array(await f.arrayBuffer()) });
+        } catch (e) {
+          out.push({ path, error: String((e && (e.message || e.name)) || e) });
         }
-        resolve(out);
-      } catch (e) { reject(e); }
+      }
+      resolve(out);
     };
     input.click();
   });
+}
+
+/// The page's WebGPU device was lost (#225): the canvas can't show anything new while the project
+/// stays open and editable. Say so over the stale picture, and offer to save the project (a
+/// download) and to reload; the reload first writes pending changes to browser storage, from
+/// which the session comes back when it is `kept` there.
+export function showDeviceLost(message, kept) {
+  if (document.getElementById("device-lost")) return;
+  const box = document.createElement("div");
+  box.id = "device-lost";
+  box.setAttribute("role", "alertdialog");
+  const title = document.createElement("strong");
+  title.textContent = "The graphics device was lost";
+  const text = document.createElement("p");
+  text.textContent =
+    "EffectCraft can't update the display any more. Your project is still open. " +
+    (kept ? "Reload to continue: the project and its unsaved changes come back." : "This session isn't kept in browser storage: save the project before you reload.");
+  const detail = document.createElement("small");
+  detail.textContent = message;
+  const save = document.createElement("button");
+  save.textContent = "Save Project";
+  save.onclick = () =>
+    self.effectcraft
+      .execute("file.save", {})
+      .catch(() => self.effectcraft.execute("file.saveAs", { path: "/Untitled Project.ecproj" }))
+      .catch((e) => (text.textContent = `Saving failed: ${(e && e.message) || e}`));
+  const reload = document.createElement("button");
+  reload.textContent = "Reload";
+  reload.onclick = async () => {
+    reload.disabled = true;
+    try {
+      await self.effectcraft.flush();
+    } catch (e) {
+      text.textContent = `Writing to browser storage failed (${(e && e.message) || e}). Save the project, or reload anyway and lose the changes.`;
+      reload.textContent = "Reload Anyway";
+      reload.disabled = false;
+      reload.onclick = () => location.reload();
+      return;
+    }
+    location.reload();
+  };
+  const buttons = document.createElement("div");
+  buttons.append(save, reload);
+  box.append(title, text, detail, buttons);
+  document.body.append(box);
 }
